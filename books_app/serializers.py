@@ -126,3 +126,22 @@ class BookSerializer(serializers.HyperlinkedModelSerializer):
                 )
         return data
 
+
+
+class GenreAssignSerializer(serializers.Serializer):
+    """Input for BookViewSet's 'add-genres' action: a list of existing Genre PKs."""
+
+    genre_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Genre.objects.all(),
+        many=True,
+        allow_empty=False,
+    )
+
+
+class AuthorBookCountSerializer(AuthorSerializer):
+    """AuthorSerializer plus the annotated `book_count` from the 'prolific' action."""
+
+    book_count = serializers.IntegerField(read_only=True)
+
+    class Meta(AuthorSerializer.Meta):
+        fields = AuthorSerializer.Meta.fields + ['book_count']
