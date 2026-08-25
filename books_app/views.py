@@ -1,43 +1,73 @@
 from datetime import date, timedelta
 
 from django.db.models import Count
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.response import Response
 
-from books_app.models import Book, Author, Genre
+from books_app.filters import BookFilter, SmartBookFilterBackend
+from books_app.models import Author, Book, Genre
+from books_app.query_params import int_param
 from books_app.serializers import (
     BookSerializer,
     AuthorSerializer,
     GenreSerializer,
     GenreAssignSerializer,
     AuthorBookCountSerializer,
+    BookStatisticsSerializer,
 )
 
 
 class BookViewSet(viewsets.ModelViewSet):
-    queryset = Book.objects.all()
+    queryset = Book.objects.select_related("author").prefetch_related("genres")
     serializer_class = BookSerializer
 
-    @action(detail=False, methods=['get'], url_path='recent')
+    # Project defaults plus the Book-specific custom backend.
+    filter_backends = [
+        DjangoFilterBackend,
+        SmartBookFilterBackend,
+        SearchFilter,
+        OrderingFilter,
+    ]
+    filterset_class = BookFilter
+    search_fields = ["title", "author__name"]
+    ordering_fields = ["title", "published_date"]
+    ordering = ["-published_date"]
+
+    @action(detail=False, methods=["get"])
     def recent(self, request):
         """GET /books/recent/?days=365 — books published within the last `days` days."""
-        try:
-            days = int(request.query_params.get('days', 365))
-        except ValueError:
-            return Response(
-                {'days': 'Must be an integer.'}, status=status.HTTP_400_BAD_REQUEST
-            )
-        if days < 1:
-            return Response(
-                {'days': 'Must be a positive integer.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+        days = int_param(request.query_params, "days", default=365, minimum=1)
         cutoff = date.today() - timedelta(days=days)
-        books = self.get_queryset().filter(published_date__gte=cutoff).order_by('-published_date')
+
+        books = self.filter_queryset(self.get_queryset()).filter(
+            published_date__gte=cutoff
+        )
         serializer = self.get_serializer(books, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def featured(self, request):
+        """GET /books/featured/?limit=5 — returns featured books ordered by genre richness and publication date."""
+        limit = int_param(request.query_params, "limit", default=5, minimum=1)
+
+        queryset = (
+            self.filter_queryset(self.get_queryset())
+            .annotate(genre_count=Count("genres"))
+            .order_by("-genre_count", "-published_date")
+        )
+        featured_books = queryset[:limit] if limit else queryset
+        serializer = self.get_serializer(featured_books, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], serializer_class=BookStatisticsSerializer)
+    def statistics(self, request, pk=None):
+        """GET /books/<pk>/statistics/ — analytical statistics for a single book."""
+        book = self.get_object()
+        serializer = self.get_serializer(book)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(
         detail=True,
@@ -51,7 +81,6 @@ class BookViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        book.genres.add(*serializer.validated_data['genre_ids'])
         return Response(
             BookSerializer(book, context=self.get_serializer_context()).data,
             status=status.HTTP_200_OK,
@@ -66,19 +95,19 @@ class AuthorViewSet(viewsets.ModelViewSet):
     def books(self, request, pk=None):
         """GET /authors/<pk>/books/ — every book written by this author."""
         author = self.get_object()
-        books = Book.objects.filter(author=author).order_by('-published_date')
+        books = (
+            Book.objects.filter(author=author)
+            .select_related("author")
+            .prefetch_related("genres")
+            .order_by("-published_date")
+        )
         serializer = self.get_serializer(books, many=True)
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'], serializer_class=AuthorBookCountSerializer)
     def prolific(self, request):
         """GET /authors/prolific/?min_books=2 — authors with at least `min_books` books."""
-        try:
-            min_books = int(request.query_params.get('min_books', 2))
-        except ValueError:
-            return Response(
-                {'min_books': 'Must be an integer.'}, status=status.HTTP_400_BAD_REQUEST
-            )
+        min_books = int_param(request.query_params, "min_books", default=2, minimum=0)
 
         authors = (
             self.get_queryset()
@@ -98,5 +127,10 @@ class GenreViewSet(viewsets.ModelViewSet):
     def books(self, request, pk=None):
         """GET /genres/<pk>/books/ — every book tagged with this genre."""
         genre = self.get_object()
-        serializer = self.get_serializer(genre.books.order_by('-published_date'), many=True)
+        books = (
+            genre.books.select_related('author')
+            .prefetch_related('genres')
+            .order_by('-published_date')
+        )
+        serializer = self.get_serializer(books, many=True)
         return Response(serializer.data)

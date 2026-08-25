@@ -46,9 +46,17 @@ class AuthorSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError("Date of birth cannot be in the future.")
         return value
 
+
+class AuthorNestedSerializer(serializers.ModelSerializer):
+    """Read-only author payload embedded in each book."""
+
+    class Meta:
+        model = Author
+        fields = ['id', 'name', 'bio', 'date_of_birth']
+
+
 class BookSerializer(serializers.HyperlinkedModelSerializer):
-    # author = AuthorSerializer(read_only=True)
-    author = serializers.SerializerMethodField()
+    author = AuthorNestedSerializer(read_only=True)
     author_custom = AuthorCustomField(read_only=True, source='author')
     time_since_published = serializers.SerializerMethodField()
 
@@ -72,43 +80,47 @@ class BookSerializer(serializers.HyperlinkedModelSerializer):
     
     class Meta:
         model = Book
-        fields = ['url', 'id', 'title', 'author', 'author_custom', 'author_id', 'genre_names', 'genre_ids', 'published_date', 'time_since_published']
+        fields = [
+            'url',
+            'id',
+            'title',
+            'author',
+            'author_custom',
+            'author_id',
+            'genre_names',
+            'genre_ids',
+            'published_date',
+            'time_since_published',
+        ]
         extra_kwargs = {
             'title': {'error_messages': {'blank': 'Title cannot be blank.'}},
         }
 
-    def get_author(self, obj):
-        return {
-            "id": obj.author.id,
-            "name": obj.author.name,
-            "bio": obj.author.bio,
-            "date_of_birth": obj.author.date_of_birth
-        }
-
     def get_time_since_published(self, obj):
-        if obj.published_date:
-            today = date.today()
-            years = today.year - obj.published_date.year
-            months = today.month - obj.published_date.month
-            days = today.day - obj.published_date.day
+        if not obj.published_date:
+            return None
 
-            if days < 0:
-                months -= 1
-                days += 30  # approximation for previous month's days
-            if months < 0:
-                years -= 1
-                months += 12
+        today = date.today()
+        years = today.year - obj.published_date.year
+        months = today.month - obj.published_date.month
+        days = today.day - obj.published_date.day
 
-            parts = []
-            if years > 0:
-                parts.append(f"{years} year{'s' if years > 1 else ''}")
-            if months > 0:
-                parts.append(f"{months} month{'s' if months > 1 else ''}")
-            if days > 0 or not parts:
-                parts.append(f"{days} day{'s' if days != 1 else ''}")
-                
-            return ", ".join(parts)
-        return None
+        if days < 0:
+            months -= 1
+            days += 30  # approximation for previous month's days
+        if months < 0:
+            years -= 1
+            months += 12
+
+        parts = []
+        if years > 0:
+            parts.append(f"{years} year{'s' if years > 1 else ''}")
+        if months > 0:
+            parts.append(f"{months} month{'s' if months > 1 else ''}")
+        if days > 0 or not parts:
+            parts.append(f"{days} day{'s' if days != 1 else ''}")
+
+        return ", ".join(parts)
 
     def validate_published_date(self, value):
         if value > date.today():
@@ -125,7 +137,6 @@ class BookSerializer(serializers.HyperlinkedModelSerializer):
                     "Published date cannot be before the author's date of birth."
                 )
         return data
-
 
 
 class GenreAssignSerializer(serializers.Serializer):
@@ -145,3 +156,48 @@ class AuthorBookCountSerializer(AuthorSerializer):
 
     class Meta(AuthorSerializer.Meta):
         fields = AuthorSerializer.Meta.fields + ['book_count']
+
+
+class BookStatisticsSerializer(serializers.Serializer):
+    """Statistics and analytical metrics for a specific book."""
+
+    book_id = serializers.IntegerField(source='id')
+    title = serializers.CharField()
+    author_name = serializers.CharField(source='author.name')
+    total_genres = serializers.SerializerMethodField()
+    days_since_published = serializers.SerializerMethodField()
+    years_since_published = serializers.SerializerMethodField()
+    author_total_books = serializers.SerializerMethodField()
+    author_age_at_publication = serializers.SerializerMethodField()
+    title_word_count = serializers.SerializerMethodField()
+    title_character_count = serializers.SerializerMethodField()
+
+    def get_total_genres(self, obj):
+        return obj.genres.count()
+
+    def get_days_since_published(self, obj):
+        if not obj.published_date:
+            return None
+        return (date.today() - obj.published_date).days
+
+    def get_years_since_published(self, obj):
+        if not obj.published_date:
+            return None
+        return round((date.today() - obj.published_date).days / 365.25, 2)
+
+    def get_author_total_books(self, obj):
+        return Book.objects.filter(author=obj.author).count()
+
+    def get_author_age_at_publication(self, obj):
+        if not obj.author.date_of_birth or not obj.published_date:
+            return None
+        dob = obj.author.date_of_birth
+        pub = obj.published_date
+        return pub.year - dob.year - ((pub.month, pub.day) < (dob.month, dob.day))
+
+    def get_title_word_count(self, obj):
+        return len(obj.title.split())
+
+    def get_title_character_count(self, obj):
+        return len(obj.title)
+

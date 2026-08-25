@@ -295,6 +295,46 @@ class BookViewTest(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(Book.objects.count(), 0)
 
+    def test_book_statistics_action(self):
+        """GET /books/<pk>/statistics/ should return analytical statistics."""
+        response = self.client.get(reverse("book-statistics", args=[self.book.pk]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        self.assertEqual(data["book_id"], self.book.pk)
+        self.assertEqual(data["title"], "1984")
+        self.assertEqual(data["author_name"], "George Orwell")
+        self.assertEqual(data["total_genres"], 1)
+        self.assertEqual(data["author_total_books"], 1)
+        self.assertEqual(data["title_word_count"], 1)
+        self.assertEqual(data["title_character_count"], 4)
+        self.assertIsNotNone(data["days_since_published"])
+        self.assertIsNotNone(data["years_since_published"])
+        self.assertEqual(data["author_age_at_publication"], 45)
+
+    def test_featured_books_action(self):
+        """GET /books/featured/ should return featured books sorted by genre count and recency."""
+        # Create another genre and book with 2 genres
+        genre2 = Genre.objects.create(name="Classic")
+        book2 = Book.objects.create(
+            title="Animal Farm",
+            author=self.author,
+            published_date=date(1945, 8, 17),
+        )
+        book2.genres.add(self.genre, genre2)
+
+        response = self.client.get(reverse("book-featured"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # book2 has 2 genres so it should be first in the featured list
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]["title"], "Animal Farm")
+        self.assertEqual(response.data[1]["title"], "1984")
+
+    def test_featured_books_action_with_limit(self):
+        """GET /books/featured/?limit=1 should return only 1 book."""
+        response = self.client.get(reverse("book-featured"), {"limit": 1})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
 
 class AuthorViewTest(APITestCase):
     """Test Author API endpoints."""
