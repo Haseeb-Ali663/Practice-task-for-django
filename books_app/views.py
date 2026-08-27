@@ -140,6 +140,7 @@ class AuthorViewSet(viewsets.ModelViewSet):
     queryset = Author.objects.all()
     serializer_class = AuthorSerializer
     pagination_class = BookPageNumberPagination
+    ordering = ['name', 'id']
 
     @action(detail=True, methods=['get'], serializer_class=BookSerializer)
     def books(self, request, pk=None):

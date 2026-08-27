@@ -1,11 +1,13 @@
 """
-Performance Optimization Benchmark Script.
+Performance Optimization Benchmark Script (Strictly Read-Only).
 Run with: python benchmark.py
+
+This script NEVER modifies, adds, or deletes any data in your database.
+It evaluates whatever records currently exist in your database.
 """
 
 import os
 import time
-from datetime import date
 
 import django
 
@@ -15,45 +17,23 @@ django.setup()
 
 from django.conf import settings
 from django.db import connection, reset_queries
-from books_app.models import Author, Book, Genre
+from books_app.models import Book
 
 # Enable SQL query tracking
 settings.DEBUG = True
 
 
-def setup_sample_data(num_books=20):
-    """Seed sample authors, genres, and books for benchmarking."""
-    print("=" * 65)
-    print(f"[+] Setting up test database with {num_books} books...")
-
-    # Clear existing data
-    Book.objects.all().delete()
-    Author.objects.all().delete()
-    Genre.objects.all().delete()
-
-    genres = [Genre.objects.create(name=f"Genre-{i}") for i in range(1, 5)]
-    authors = [
-        Author.objects.create(name=f"Author-{i}", date_of_birth=date(1980, 1, 1))
-        for i in range(1, 6)
-    ]
-
-    for i in range(1, num_books + 1):
-        book = Book.objects.create(
-            title=f"Sample Book {i:02d}",
-            author=authors[i % len(authors)],
-            published_date=date(2000 + (i % 20), 1, 1),
-        )
-        book.genres.set(genres[: (i % 4) + 1])
-
-    print("[+] Sample data ready.\n")
-
-
 def run_benchmark():
-    num_books = Book.objects.count()
+    total_books = Book.objects.count()
 
     print("=" * 65)
-    print(f"[*] RUNNING BENCHMARK ({num_books} Books in Database)")
+    print(f"[*] READ-ONLY BENCHMARK ({total_books} Books Found in Database)")
     print("=" * 65)
+
+    if total_books == 0:
+        print("[!] No books found in your database.")
+        print("[!] Add some books through your API or admin, then run this again.\n")
+        return
 
     # -------------------------------------------------------------
     # 1. UNOPTIMIZED TRAVERSAL (N+1 Query Problem)
@@ -62,15 +42,9 @@ def run_benchmark():
     start_unopt = time.perf_counter()
 
     unopt_books = list(Book.objects.all())
-    unopt_results = []
     for b in unopt_books:
-        unopt_results.append(
-            {
-                "title": b.title,
-                "author": b.author.name,  # Triggers 1 SELECT per book
-                "genres": [g.name for g in b.genres.all()],  # Triggers 1 SELECT per book
-            }
-        )
+        _ = b.author.name          # Triggers 1 extra query per book
+        _ = [g.name for g in b.genres.all()]  # Triggers 1 extra query per book
 
     time_unopt = (time.perf_counter() - start_unopt) * 1000  # in ms
     queries_unopt = len(connection.queries)
@@ -84,15 +58,9 @@ def run_benchmark():
     opt_books = list(
         Book.objects.select_related("author").prefetch_related("genres")
     )
-    opt_results = []
     for b in opt_books:
-        opt_results.append(
-            {
-                "title": b.title,
-                "author": b.author.name,  # 0 extra queries (JOINed in 1st query)
-                "genres": [g.name for g in b.genres.all()],  # 0 extra queries (prefetched in 2nd query)
-            }
-        )
+        _ = b.author.name          # 0 extra queries (JOINed in query 1)
+        _ = [g.name for g in b.genres.all()]  # 0 extra queries (prefetched in query 2)
 
     time_opt = (time.perf_counter() - start_opt) * 1000  # in ms
     queries_opt = len(connection.queries)
@@ -104,7 +72,7 @@ def run_benchmark():
     start_cond = time.perf_counter()
 
     cond_books = list(Book.objects.only("id", "title", "published_date"))
-    cond_results = [{"title": b.title} for b in cond_books]
+    _ = [b.title for b in cond_books]
 
     time_cond = (time.perf_counter() - start_cond) * 1000  # in ms
     queries_cond = len(connection.queries)
@@ -112,7 +80,11 @@ def run_benchmark():
     # -------------------------------------------------------------
     # RESULTS TABLE
     # -------------------------------------------------------------
-    query_reduction = ((queries_unopt - queries_opt) / queries_unopt) * 100
+    query_reduction = (
+        ((queries_unopt - queries_opt) / queries_unopt) * 100
+        if queries_unopt > 0
+        else 0
+    )
 
     print(f"{'Strategy':<35} | {'SQL Queries':<12} | {'Time (ms)':<10}")
     print("-" * 65)
@@ -123,8 +95,9 @@ def run_benchmark():
     print(f"\n[Result] Query Reduction: {query_reduction:.1f}% fewer SQL queries ({queries_unopt} -> {queries_opt})")
     print(f"[Result] Time Improvement: {time_unopt / max(time_opt, 0.001):.1f}x faster\n")
     print("=" * 65)
+    print("[+] Database was read only. Zero records added, modified, or deleted.\n")
 
 
 if __name__ == "__main__":
-    setup_sample_data(num_books=25)
     run_benchmark()
+
