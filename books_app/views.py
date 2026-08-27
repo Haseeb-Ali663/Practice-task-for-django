@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from books_app.filters import BookFilter, SmartBookFilterBackend
 from books_app.models import Author, Book, Genre
+from books_app.pagination import BookCursorPagination, BookLimitOffsetPagination, BookPageNumberPagination
 from books_app.query_params import int_param
 from books_app.serializers import (
     BookSerializer,
@@ -23,6 +24,7 @@ from books_app.serializers import (
 class BookViewSet(viewsets.ModelViewSet):
     queryset = Book.objects.select_related("author").prefetch_related("genres")
     serializer_class = BookSerializer
+    pagination_class = BookLimitOffsetPagination
 
     # Project defaults plus the Book-specific custom backend.
     filter_backends = [
@@ -90,6 +92,7 @@ class BookViewSet(viewsets.ModelViewSet):
 class AuthorViewSet(viewsets.ModelViewSet):
     queryset = Author.objects.all()
     serializer_class = AuthorSerializer
+    pagination_class = BookPageNumberPagination
 
     @action(detail=True, methods=['get'], serializer_class=BookSerializer)
     def books(self, request, pk=None):
@@ -122,6 +125,7 @@ class AuthorViewSet(viewsets.ModelViewSet):
 class GenreViewSet(viewsets.ModelViewSet):
     queryset = Genre.objects.all()
     serializer_class = GenreSerializer
+    pagination_class = BookCursorPagination
 
     @action(detail=True, methods=['get'], serializer_class=BookSerializer)
     def books(self, request, pk=None):

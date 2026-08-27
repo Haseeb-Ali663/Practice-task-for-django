@@ -240,11 +240,13 @@ class BookViewTest(APITestCase):
         self.book.genres.add(self.genre)
 
     def test_list_books(self):
-        """GET /books/ should return 200 with a list of books."""
+        """GET /books/ should return 200 with a paginated list of books."""
         response = self.client.get(reverse("book-list"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-        self.assertEqual(response.data[0]["title"], "1984")
+        self.assertIn("results", response.data)
+        self.assertIn("pagination", response.data)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["title"], "1984")
 
     def test_create_book(self):
         """POST /books/ with valid data should return 201."""
@@ -349,7 +351,9 @@ class AuthorViewTest(APITestCase):
     def test_list_authors(self):
         response = self.client.get(reverse("author-list"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
+        self.assertIn("results", response.data)
+        self.assertIn("pagination", response.data)
+        self.assertEqual(len(response.data["results"]), 1)
 
     def test_create_author(self):
         payload = {
@@ -400,7 +404,9 @@ class GenreViewTest(APITestCase):
     def test_list_genres(self):
         response = self.client.get(reverse("genre-list"))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
+        self.assertIn("results", response.data)
+        self.assertIn("pagination", response.data)
+        self.assertEqual(len(response.data["results"]), 1)
 
     def test_create_genre(self):
         payload = {"name": "Thriller"}
@@ -417,3 +423,459 @@ class GenreViewTest(APITestCase):
         response = self.client.delete(reverse("genre-detail", args=[self.genre.pk]))
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(Genre.objects.count(), 0)
+
+
+# ──────────────────────────────────────────────
+#  4. PAGINATION TESTS
+# ──────────────────────────────────────────────
+
+class BookPaginationTest(APITestCase):
+    """Tests for BookLimitOffsetPagination on GET /books/."""
+
+    def setUp(self):
+        self.author = Author.objects.create(
+            name="Test Author",
+            bio="A test author.",
+            date_of_birth=date(1970, 1, 1),
+        )
+        # Create 15 books so we can paginate across them
+        for i in range(1, 16):
+            Book.objects.create(
+                title=f"Book {i:02d}",
+                author=self.author,
+                published_date=date(2000 + i, 1, 1),
+            )
+
+    # -- Response envelope ------------------------------------------------
+
+    def test_response_has_pagination_envelope(self):
+        """List response must include 'pagination' and 'results' keys."""
+        response = self.client.get(reverse("book-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("pagination", response.data)
+        self.assertIn("results", response.data)
+
+    def test_pagination_metadata_fields(self):
+        """'pagination' block must carry all expected metadata fields."""
+        response = self.client.get(reverse("book-list"))
+        p = response.data["pagination"]
+        for field in (
+            "total_count", "limit", "offset",
+            "page_count", "current_page",
+            "next", "previous", "has_next", "has_previous",
+        ):
+            self.assertIn(field, p, msg=f"Missing pagination field: {field}")
+
+    # -- Default behaviour ------------------------------------------------
+
+    def test_default_limit_is_10(self):
+        """Without ?limit the default of 10 results should be returned."""
+        response = self.client.get(reverse("book-list"))
+        self.assertEqual(len(response.data["results"]), 10)
+        self.assertEqual(response.data["pagination"]["limit"], 10)
+
+    def test_total_count(self):
+        """total_count should reflect the full queryset size (15)."""
+        response = self.client.get(reverse("book-list"))
+        self.assertEqual(response.data["pagination"]["total_count"], 15)
+
+    def test_default_offset_is_zero(self):
+        """Without ?offset the offset should default to 0."""
+        response = self.client.get(reverse("book-list"))
+        self.assertEqual(response.data["pagination"]["offset"], 0)
+
+    # -- Custom limit / offset --------------------------------------------
+
+    def test_custom_limit(self):
+        """?limit=5 should return 5 results."""
+        response = self.client.get(reverse("book-list"), {"limit": 5})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 5)
+        self.assertEqual(response.data["pagination"]["limit"], 5)
+
+    def test_custom_offset(self):
+        """?limit=5&offset=10 should return the last 5 of 15 books."""
+        response = self.client.get(reverse("book-list"), {"limit": 5, "offset": 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 5)
+        self.assertEqual(response.data["pagination"]["offset"], 10)
+
+    def test_offset_beyond_count_returns_empty(self):
+        """An offset past the end of the queryset should return an empty result list."""
+        response = self.client.get(reverse("book-list"), {"offset": 100})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 0)
+
+    # -- Computed metadata ------------------------------------------------
+
+    def test_page_count(self):
+        """15 books with limit=10 should give page_count=2."""
+        response = self.client.get(reverse("book-list"), {"limit": 10})
+        self.assertEqual(response.data["pagination"]["page_count"], 2)
+
+    def test_current_page_first(self):
+        """offset=0, limit=10 → current_page=1."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 0})
+        self.assertEqual(response.data["pagination"]["current_page"], 1)
+
+    def test_current_page_second(self):
+        """offset=10, limit=10 → current_page=2."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 10})
+        self.assertEqual(response.data["pagination"]["current_page"], 2)
+
+    # -- Navigation links -------------------------------------------------
+
+    def test_next_link_present_on_first_page(self):
+        """First page should have a 'next' URL and has_next=True."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 0})
+        p = response.data["pagination"]
+        self.assertTrue(p["has_next"])
+        self.assertIsNotNone(p["next"])
+
+    def test_previous_link_absent_on_first_page(self):
+        """First page should have no 'previous' URL and has_previous=False."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 0})
+        p = response.data["pagination"]
+        self.assertFalse(p["has_previous"])
+        self.assertIsNone(p["previous"])
+
+    def test_previous_link_present_on_second_page(self):
+        """Second page should have a 'previous' URL and has_previous=True."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 10})
+        p = response.data["pagination"]
+        self.assertTrue(p["has_previous"])
+        self.assertIsNotNone(p["previous"])
+
+    def test_next_link_absent_on_last_page(self):
+        """Last page should have no 'next' URL and has_next=False."""
+        response = self.client.get(reverse("book-list"), {"limit": 10, "offset": 10})
+        p = response.data["pagination"]
+        self.assertFalse(p["has_next"])
+        self.assertIsNone(p["next"])
+
+
+# ──────────────────────────────────────────────
+#  5. PAGE-NUMBER PAGINATION TESTS
+# ──────────────────────────────────────────────
+
+class AuthorPageNumberPaginationTest(APITestCase):
+    """
+    Tests for BookPageNumberPagination on GET /authors/.
+
+    Default page_size=5, configurable via ?page_size=N (max 50).
+    Navigation via ?page=N.
+    """
+
+    def setUp(self):
+        # Create 12 authors so we get 3 pages at default page_size=5
+        # (page 1: 5, page 2: 5, page 3: 2)
+        for i in range(1, 13):
+            Author.objects.create(
+                name=f"Author {i:02d}",
+                bio=f"Bio for author {i}.",
+            )
+
+    # -- Response envelope ------------------------------------------------
+
+    def test_response_has_pagination_envelope(self):
+        """List response must include 'pagination' and 'results' keys."""
+        response = self.client.get(reverse("author-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("pagination", response.data)
+        self.assertIn("results", response.data)
+
+    def test_pagination_metadata_fields(self):
+        """'pagination' block must carry all expected metadata fields."""
+        response = self.client.get(reverse("author-list"))
+        p = response.data["pagination"]
+        for field in (
+            "total_count", "page_size", "page_count",
+            "current_page", "next", "previous",
+            "has_next", "has_previous",
+        ):
+            self.assertIn(field, p, msg=f"Missing pagination field: {field}")
+
+    # -- Default behaviour ------------------------------------------------
+
+    def test_default_page_size_is_5(self):
+        """Without ?page_size the default of 5 results should be returned."""
+        response = self.client.get(reverse("author-list"))
+        self.assertEqual(len(response.data["results"]), 5)
+        self.assertEqual(response.data["pagination"]["page_size"], 5)
+
+    def test_total_count(self):
+        """total_count should reflect the full queryset size (12)."""
+        response = self.client.get(reverse("author-list"))
+        self.assertEqual(response.data["pagination"]["total_count"], 12)
+
+    def test_default_page_is_first(self):
+        """Without ?page the first page (current_page=1) should be returned."""
+        response = self.client.get(reverse("author-list"))
+        self.assertEqual(response.data["pagination"]["current_page"], 1)
+
+    # -- page_count -------------------------------------------------------
+
+    def test_page_count_default_size(self):
+        """12 authors at page_size=5 should give page_count=3."""
+        response = self.client.get(reverse("author-list"))
+        self.assertEqual(response.data["pagination"]["page_count"], 3)
+
+    def test_page_count_custom_size(self):
+        """12 authors at page_size=4 should give page_count=3."""
+        response = self.client.get(reverse("author-list"), {"page_size": 4})
+        self.assertEqual(response.data["pagination"]["page_count"], 3)
+
+    # -- Custom page_size -------------------------------------------------
+
+    def test_custom_page_size(self):
+        """?page_size=3 should return 3 results on page 1."""
+        response = self.client.get(reverse("author-list"), {"page_size": 3})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 3)
+        self.assertEqual(response.data["pagination"]["page_size"], 3)
+
+    def test_page_size_capped_at_max(self):
+        """?page_size=999 should be silently capped at max_page_size=50."""
+        response = self.client.get(reverse("author-list"), {"page_size": 999})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(response.data["pagination"]["page_size"], 50)
+
+    # -- Navigation by page number ----------------------------------------
+
+    def test_navigate_to_page_2(self):
+        """?page=2 should return the second batch of results."""
+        response = self.client.get(reverse("author-list"), {"page": 2})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["pagination"]["current_page"], 2)
+        self.assertEqual(len(response.data["results"]), 5)
+
+    def test_last_page_has_remainder(self):
+        """Page 3 of 12 authors at page_size=5 should have 2 results."""
+        response = self.client.get(reverse("author-list"), {"page": 3})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 2)
+
+    def test_invalid_page_returns_404(self):
+        """A page number beyond the last page should return 404."""
+        response = self.client.get(reverse("author-list"), {"page": 999})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    # -- Navigation links -------------------------------------------------
+
+    def test_next_link_present_on_first_page(self):
+        """First page should have a 'next' URL and has_next=True."""
+        response = self.client.get(reverse("author-list"), {"page": 1})
+        p = response.data["pagination"]
+        self.assertTrue(p["has_next"])
+        self.assertIsNotNone(p["next"])
+
+    def test_previous_link_absent_on_first_page(self):
+        """First page should have no 'previous' URL and has_previous=False."""
+        response = self.client.get(reverse("author-list"), {"page": 1})
+        p = response.data["pagination"]
+        self.assertFalse(p["has_previous"])
+        self.assertIsNone(p["previous"])
+
+    def test_previous_link_present_on_page_2(self):
+        """Page 2 should have a 'previous' URL and has_previous=True."""
+        response = self.client.get(reverse("author-list"), {"page": 2})
+        p = response.data["pagination"]
+        self.assertTrue(p["has_previous"])
+        self.assertIsNotNone(p["previous"])
+
+    def test_next_link_absent_on_last_page(self):
+        """Last page should have no 'next' URL and has_next=False."""
+        response = self.client.get(reverse("author-list"), {"page": 3})
+        p = response.data["pagination"]
+        self.assertFalse(p["has_next"])
+        self.assertIsNone(p["next"])
+
+
+# ──────────────────────────────────────────────
+#  6. CURSOR PAGINATION TESTS
+# ──────────────────────────────────────────────
+
+class GenreCursorPaginationTest(APITestCase):
+    """
+    Tests for BookCursorPagination on GET /genres/.
+
+    Key properties of cursor pagination:
+      - Results arrive in pages via opaque cursor tokens in 'next'/'previous' URLs.
+      - NO total_count or page_count (by design: avoids expensive COUNT queries).
+      - Ordering is always stable: by 'name' ASC, then 'id' ASC as tiebreaker.
+      - Custom page size via ?page_size=N (default: 5, max: 50).
+      - An invalid cursor token returns HTTP 404.
+    """
+
+    @staticmethod
+    def _create_genres(count):
+        """Helper: create `count` genres with predictable alphabetical names."""
+        for i in range(1, count + 1):
+            Genre.objects.create(name=f"Genre {i:02d}")
+
+    # -- Response envelope ------------------------------------------------
+
+    def test_response_has_pagination_envelope(self):
+        """List response must include 'pagination' and 'results' keys."""
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("pagination", response.data)
+        self.assertIn("results", response.data)
+
+    def test_pagination_metadata_fields(self):
+        """'pagination' block must carry page_size, next, previous, has_next, has_previous."""
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"))
+        p = response.data["pagination"]
+        for field in ("page_size", "next", "previous", "has_next", "has_previous"):
+            self.assertIn(field, p, msg=f"Missing pagination field: {field}")
+
+    def test_no_total_count_field(self):
+        """
+        Cursor pagination must NOT expose total_count or page_count.
+        Those would require a COUNT(*) query, defeating cursor pagination's
+        performance advantage.
+        """
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"))
+        p = response.data["pagination"]
+        self.assertNotIn("total_count", p)
+        self.assertNotIn("page_count", p)
+        self.assertNotIn("current_page", p)
+
+    # -- Default behaviour ------------------------------------------------
+
+    def test_default_page_size_is_5(self):
+        """Without ?page_size the default of 5 results should be returned."""
+        self._create_genres(8)
+        response = self.client.get(reverse("genre-list"))
+        self.assertEqual(len(response.data["results"]), 5)
+        self.assertEqual(response.data["pagination"]["page_size"], 5)
+
+    def test_all_results_fit_on_one_page(self):
+        """When total items <= page_size, all items are returned in one shot."""
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"))
+        self.assertEqual(len(response.data["results"]), 3)
+
+    # -- Custom page_size -------------------------------------------------
+
+    def test_custom_page_size(self):
+        """?page_size=3 should return 3 results."""
+        self._create_genres(8)
+        response = self.client.get(reverse("genre-list"), {"page_size": 3})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 3)
+        self.assertEqual(response.data["pagination"]["page_size"], 3)
+
+    def test_page_size_capped_at_max(self):
+        """?page_size=999 should be silently capped at max_page_size=50."""
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"), {"page_size": 999})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(response.data["pagination"]["page_size"], 50)
+
+    # -- Navigation links on first page -----------------------------------
+
+    def test_first_page_has_next_when_more_results(self):
+        """First page has has_next=True and a non-null 'next' URL when there are more items."""
+        self._create_genres(8)  # 8 genres, page_size=5 => 2 pages
+        response = self.client.get(reverse("genre-list"))
+        p = response.data["pagination"]
+        self.assertTrue(p["has_next"])
+        self.assertIsNotNone(p["next"])
+
+    def test_first_page_has_no_previous(self):
+        """First page has has_previous=False and previous=null."""
+        self._create_genres(8)
+        response = self.client.get(reverse("genre-list"))
+        p = response.data["pagination"]
+        self.assertFalse(p["has_previous"])
+        self.assertIsNone(p["previous"])
+
+    def test_single_page_has_no_next_or_previous(self):
+        """When all results fit on one page, both next and previous must be null."""
+        self._create_genres(3)  # 3 genres, page_size=5 => fits on one page
+        response = self.client.get(reverse("genre-list"))
+        p = response.data["pagination"]
+        self.assertFalse(p["has_next"])
+        self.assertIsNone(p["next"])
+        self.assertFalse(p["has_previous"])
+        self.assertIsNone(p["previous"])
+
+    # -- Cursor traversal (follow 'next' link) ----------------------------
+
+    def test_cursor_traversal_covers_all_items(self):
+        """
+        Following 'next' links from page 1 until exhausted must yield
+        every item exactly once.
+        """
+        self._create_genres(12)  # 12 genres, page_size=5 => 3 pages
+        collected_names = []
+        url = reverse("genre-list")
+        params = {"page_size": 5}
+
+        while url:
+            response = self.client.get(url, params)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            collected_names.extend(
+                item["name"] for item in response.data["results"]
+            )
+            next_url = response.data["pagination"]["next"]
+            # After the first request params are encoded in the cursor URL
+            url = next_url
+            params = {}  # cursor token already carries all state
+
+        self.assertEqual(len(collected_names), 12)
+        # Items must arrive in the declared ordering (name ASC)
+        self.assertEqual(collected_names, sorted(collected_names))
+
+    def test_second_page_has_previous_link(self):
+        """The second page (reached via 'next') must have a 'previous' link."""
+        self._create_genres(8)
+        # Get first page
+        first = self.client.get(reverse("genre-list"))
+        next_url = first.data["pagination"]["next"]
+        self.assertIsNotNone(next_url, "Expected a next URL from the first page")
+
+        # Follow next to get second page
+        second = self.client.get(next_url)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        p = second.data["pagination"]
+        self.assertTrue(p["has_previous"])
+        self.assertIsNotNone(p["previous"])
+
+    def test_last_page_has_no_next(self):
+        """The final page (no more items) must have has_next=False."""
+        self._create_genres(8)  # 8 genres, page_size=5 => last page has 3
+        # Navigate to the last page
+        first = self.client.get(reverse("genre-list"))
+        next_url = first.data["pagination"]["next"]
+        last = self.client.get(next_url)
+
+        self.assertEqual(last.status_code, status.HTTP_200_OK)
+        p = last.data["pagination"]
+        self.assertFalse(p["has_next"])
+        self.assertIsNone(p["next"])
+        # Last page should contain the remaining 3 genres
+        self.assertEqual(len(last.data["results"]), 3)
+
+    # -- Stable ordering --------------------------------------------------
+
+    def test_results_ordered_by_name(self):
+        """Results must arrive sorted by 'name' ASC (the declared cursor ordering)."""
+        Genre.objects.create(name="Zebra")
+        Genre.objects.create(name="Apple")
+        Genre.objects.create(name="Mango")
+        response = self.client.get(reverse("genre-list"))
+        names = [item["name"] for item in response.data["results"]]
+        self.assertEqual(names, sorted(names))
+
+    # -- Invalid cursor ---------------------------------------------------
+
+    def test_invalid_cursor_returns_404(self):
+        """A tampered / invalid cursor token must return HTTP 404."""
+        self._create_genres(3)
+        response = self.client.get(reverse("genre-list"), {"cursor": "not-a-valid-cursor"})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
