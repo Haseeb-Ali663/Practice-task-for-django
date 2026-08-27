@@ -1,11 +1,19 @@
 from datetime import date, timedelta
+from django.contrib.auth.models import User
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APITestCase, APIRequestFactory
 from rest_framework import status
 
 from books_app.models import Author, Book, Genre
-from books_app.serializers import AuthorSerializer, BookSerializer, GenreSerializer
+from books_app.serializers import (
+    AuthorSerializer,
+    BookSerializer,
+    BookListSerializer,
+    BookDetailSerializer,
+    GenreSerializer,
+)
+from books_app.views import BookViewSet
 
 
 # ──────────────────────────────────────────────
@@ -879,3 +887,270 @@ class GenreCursorPaginationTest(APITestCase):
         self._create_genres(3)
         response = self.client.get(reverse("genre-list"), {"cursor": "not-a-valid-cursor"})
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+# ──────────────────────────────────────────────
+#  7. DYNAMIC SERIALIZER TESTS (LIST VS DETAIL)
+# ──────────────────────────────────────────────
+
+class BookListSerializerTest(TestCase):
+    """Test serialization for the lightweight BookListSerializer."""
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.author = Author.objects.create(
+            name="George Orwell",
+            bio="English novelist.",
+            date_of_birth=date(1903, 6, 25),
+        )
+        self.genre = Genre.objects.create(name="Fiction")
+        self.book = Book.objects.create(
+            title="1984",
+            author=self.author,
+            published_date=date(1949, 6, 8),
+        )
+        self.book.genres.add(self.genre)
+
+    def test_book_list_serialization_fields(self):
+        """BookListSerializer should include concise summary fields and exclude heavy computed/nested ones."""
+        request = self.factory.get("/books/")
+        serializer = BookListSerializer(self.book, context={"request": request})
+        data = serializer.data
+
+        # Present fields
+        self.assertEqual(data["title"], "1984")
+        self.assertEqual(data["author_name"], "George Orwell")
+        self.assertEqual(data["genre_names"], ["Fiction"])
+        self.assertEqual(data["published_date"], "1949-06-08")
+        self.assertIn("url", data)
+        self.assertIn("id", data)
+
+        # Excluded heavyweight / detail fields
+        self.assertNotIn("time_since_published", data)
+        self.assertNotIn("author_custom", data)
+        # author should not be a nested dict in list serializer
+        self.assertNotIn("author", data)
+
+
+class BookDynamicSerializerActionTest(APITestCase):
+    """Test that BookViewSet switches serializers dynamically based on action."""
+
+    def setUp(self):
+        self.author = Author.objects.create(
+            name="Aldous Huxley",
+            bio="English writer and philosopher.",
+            date_of_birth=date(1894, 7, 26),
+        )
+        self.genre = Genre.objects.create(name="Dystopian")
+        self.book = Book.objects.create(
+            title="Brave New World",
+            author=self.author,
+            published_date=date(1932, 1, 1),
+        )
+        self.book.genres.add(self.genre)
+
+    def test_get_serializer_class_action_mapping(self):
+        """get_serializer_class() returns the expected serializer class per action."""
+        viewset = BookViewSet()
+
+        # List actions
+        viewset.action = "list"
+        self.assertEqual(viewset.get_serializer_class(), BookListSerializer)
+
+        viewset.action = "recent"
+        self.assertEqual(viewset.get_serializer_class(), BookListSerializer)
+
+        viewset.action = "featured"
+        self.assertEqual(viewset.get_serializer_class(), BookListSerializer)
+
+        # Detail / mutation actions
+        viewset.action = "retrieve"
+        self.assertEqual(viewset.get_serializer_class(), BookDetailSerializer)
+
+        viewset.action = "create"
+        self.assertEqual(viewset.get_serializer_class(), BookDetailSerializer)
+
+        viewset.action = "update"
+        self.assertEqual(viewset.get_serializer_class(), BookDetailSerializer)
+
+        viewset.action = "partial_update"
+        self.assertEqual(viewset.get_serializer_class(), BookDetailSerializer)
+
+    def test_list_endpoint_uses_list_serializer_structure(self):
+        """GET /books/ returns lightweight items with author_name and without time_since_published."""
+        response = self.client.get(reverse("book-list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        item = response.data["results"][0]
+        self.assertEqual(item["title"], "Brave New World")
+        self.assertEqual(item["author_name"], "Aldous Huxley")
+        self.assertEqual(item["genre_names"], ["Dystopian"])
+        self.assertNotIn("time_since_published", item)
+        self.assertNotIn("author_custom", item)
+        self.assertNotIn("author", item)
+
+    def test_detail_endpoint_uses_detail_serializer_structure(self):
+        """GET /books/<pk>/ returns rich items with nested author and time_since_published."""
+        response = self.client.get(reverse("book-detail", args=[self.book.pk]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        data = response.data
+        self.assertEqual(data["title"], "Brave New World")
+        self.assertIn("author", data)
+        self.assertIsInstance(data["author"], dict)
+        self.assertEqual(data["author"]["name"], "Aldous Huxley")
+        self.assertIn("author_custom", data)
+        self.assertIn("time_since_published", data)
+
+
+class BookPermissionConditionalFieldsTest(APITestCase):
+    """Test conditional fields in BookDetailSerializer based on user permissions."""
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.author = Author.objects.create(
+            name="George Orwell",
+            bio="English author",
+            date_of_birth=date(1903, 6, 25),
+        )
+        self.genre = Genre.objects.create(name="Dystopian")
+        self.book = Book.objects.create(
+            title="Animal Farm",
+            author=self.author,
+            published_date=date(1945, 8, 17),
+        )
+        self.book.genres.add(self.genre)
+
+        self.regular_user = User.objects.create_user(
+            username="regular_user",
+            password="password123",
+            is_staff=False,
+        )
+        self.staff_user = User.objects.create_user(
+            username="staff_user",
+            password="password123",
+            is_staff=True,
+        )
+
+    def test_anonymous_user_detail_does_not_see_admin_metadata(self):
+        """Unauthenticated users should not see the admin_metadata field."""
+        response = self.client.get(reverse("book-detail", args=[self.book.pk]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("admin_metadata", response.data)
+
+    def test_regular_user_detail_does_not_see_admin_metadata(self):
+        """Authenticated non-staff users should not see the admin_metadata field."""
+        self.client.force_authenticate(user=self.regular_user)
+        response = self.client.get(reverse("book-detail", args=[self.book.pk]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("admin_metadata", response.data)
+
+    def test_staff_user_detail_sees_admin_metadata(self):
+        """Staff members should see the privileged admin_metadata field with sensitive data."""
+        self.client.force_authenticate(user=self.staff_user)
+        response = self.client.get(reverse("book-detail", args=[self.book.pk]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("admin_metadata", response.data)
+
+        admin_meta = response.data["admin_metadata"]
+        self.assertEqual(admin_meta["internal_code"], f"LIB-BK-{self.book.pk:05d}")
+        self.assertEqual(admin_meta["author_id"], self.author.pk)
+        self.assertEqual(admin_meta["genres_count"], 1)
+
+    def test_serializer_unit_conditional_fields(self):
+        """Direct unit test of BookDetailSerializer with different request user contexts."""
+        # 1. No request context (inspect fields)
+        s_no_ctx = BookDetailSerializer(self.book)
+        self.assertNotIn("admin_metadata", s_no_ctx.fields)
+
+        # 2. Anonymous request context
+        req_anon = self.factory.get("/books/1/")
+        s_anon = BookDetailSerializer(self.book, context={"request": req_anon})
+        self.assertNotIn("admin_metadata", s_anon.data)
+
+        # 3. Regular user context
+        req_reg = self.factory.get("/books/1/")
+        req_reg.user = self.regular_user
+        s_reg = BookDetailSerializer(self.book, context={"request": req_reg})
+        self.assertNotIn("admin_metadata", s_reg.data)
+
+        # 4. Staff user context
+        req_staff = self.factory.get("/books/1/")
+        req_staff.user = self.staff_user
+        s_staff = BookDetailSerializer(self.book, context={"request": req_staff})
+        self.assertIn("admin_metadata", s_staff.data)
+        self.assertEqual(s_staff.data["admin_metadata"]["internal_code"], f"LIB-BK-{self.book.pk:05d}")
+
+
+# ──────────────────────────────────────────────
+#  8. DYNAMIC FIELD FILTERING TESTS (?fields=...)
+# ──────────────────────────────────────────────
+
+class DynamicFieldsSerializerTest(APITestCase):
+    """Test dynamic field adaptation based on ?fields= and ?exclude= query parameters."""
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.author = Author.objects.create(
+            name="George Orwell",
+            bio="English author",
+            date_of_birth=date(1903, 6, 25),
+        )
+        self.genre = Genre.objects.create(name="Dystopian")
+        self.book = Book.objects.create(
+            title="1984",
+            author=self.author,
+            published_date=date(1949, 6, 8),
+        )
+        self.book.genres.add(self.genre)
+
+    def test_list_endpoint_fields_query_param(self):
+        """GET /books/?fields=title,published_date returns only those specified fields in results."""
+        response = self.client.get(reverse("book-list"), {"fields": "title,published_date"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        item = response.data["results"][0]
+        self.assertEqual(set(item.keys()), {"title", "published_date"})
+        self.assertEqual(item["title"], "1984")
+        self.assertEqual(item["published_date"], "1949-06-08")
+
+    def test_detail_endpoint_fields_query_param(self):
+        """GET /books/<pk>/?fields=id,title returns only id and title."""
+        response = self.client.get(
+            reverse("book-detail", args=[self.book.pk]),
+            {"fields": "id,title"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(set(response.data.keys()), {"id", "title"})
+        self.assertEqual(response.data["title"], "1984")
+        self.assertEqual(response.data["id"], self.book.pk)
+
+    def test_detail_endpoint_exclude_query_param(self):
+        """GET /books/<pk>/?exclude=author_custom,time_since_published excludes those fields."""
+        response = self.client.get(
+            reverse("book-detail", args=[self.book.pk]),
+            {"exclude": "author_custom,time_since_published"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("author_custom", response.data)
+        self.assertNotIn("time_since_published", response.data)
+        self.assertIn("title", response.data)
+        self.assertIn("author", response.data)
+
+    def test_author_endpoint_fields_query_param(self):
+        """GET /authors/?fields=name returns only name in author results."""
+        response = self.client.get(reverse("author-list"), {"fields": "name"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        item = response.data["results"][0]
+        self.assertEqual(set(item.keys()), {"name"})
+        self.assertEqual(item["name"], "George Orwell")
+
+    def test_serializer_explicit_fields_argument(self):
+        """Passing fields directly to serializer constructor filters fields."""
+        serializer = BookListSerializer(self.book, fields=["title", "author_name"])
+        self.assertEqual(set(serializer.data.keys()), {"title", "author_name"})
+        self.assertEqual(serializer.data["title"], "1984")
+        self.assertEqual(serializer.data["author_name"], "George Orwell")
+
+
+

@@ -3,6 +3,44 @@ from rest_framework import serializers
 from books_app.models import Book, Author, Genre
 
 
+class DynamicFieldsSerializerMixin:
+    """
+    A serializer mixin that dynamically adapts returned fields based on:
+    1. Explicit `fields` / `exclude` iterable passed at instantiation, OR
+    2. Query parameters `?fields=field1,field2` or `?exclude=field1,field2` from the request.
+
+    Example requests:
+        GET /books/?fields=title,author_name
+        GET /books/1/?fields=title,published_date,time_since_published
+        GET /authors/?fields=name,bio
+    """
+
+    def __init__(self, *args, **kwargs):
+        fields = kwargs.pop('fields', None)
+        exclude = kwargs.pop('exclude', None)
+
+        super().__init__(*args, **kwargs)
+
+        request = self.context.get('request')
+        if request and hasattr(request, 'query_params'):
+            if fields is None and 'fields' in request.query_params:
+                raw = request.query_params.get('fields', '')
+                fields = [f.strip() for f in raw.split(',') if f.strip()]
+            if exclude is None and 'exclude' in request.query_params:
+                raw_exclude = request.query_params.get('exclude', '')
+                exclude = [f.strip() for f in raw_exclude.split(',') if f.strip()]
+
+        if fields is not None:
+            allowed = set(fields)
+            existing = set(self.fields)
+            for field_name in existing - allowed:
+                self.fields.pop(field_name, None)
+
+        if exclude is not None:
+            for field_name in set(exclude):
+                self.fields.pop(field_name, None)
+
+
 class AuthorCustomField(serializers.RelatedField):
     """
     A custom relational field that displays the author as
@@ -28,7 +66,7 @@ class GenreSerializer(serializers.HyperlinkedModelSerializer):
         fields = ['url', 'name']
 
 
-class AuthorSerializer(serializers.HyperlinkedModelSerializer):
+class AuthorSerializer(DynamicFieldsSerializerMixin, serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Author
         fields = ['url', 'name', 'bio', 'date_of_birth']
@@ -55,10 +93,37 @@ class AuthorNestedSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'bio', 'date_of_birth']
 
 
-class BookSerializer(serializers.HyperlinkedModelSerializer):
+class BookListSerializer(DynamicFieldsSerializerMixin, serializers.HyperlinkedModelSerializer):
+    """
+    Lightweight serializer optimized for collection/list endpoints.
+    Excludes heavyweight nested objects and computed analytical properties.
+    Supports dynamic field filtering via `?fields=...` query parameter.
+    """
+    author_name = serializers.CharField(source='author.name', read_only=True)
+    genre_names = serializers.StringRelatedField(source='genres', many=True, read_only=True)
+
+    class Meta:
+        model = Book
+        fields = [
+            'url',
+            'id',
+            'title',
+            'author_name',
+            'genre_names',
+            'published_date',
+        ]
+
+
+class BookDetailSerializer(DynamicFieldsSerializerMixin, serializers.HyperlinkedModelSerializer):
+    """
+    Comprehensive serializer for single-resource detail views and write actions.
+    Includes nested author details, custom representations, validation logic,
+    conditional fields based on permissions, and dynamic field filtering via `?fields=...`.
+    """
     author = AuthorNestedSerializer(read_only=True)
     author_custom = AuthorCustomField(read_only=True, source='author')
     time_since_published = serializers.SerializerMethodField()
+    admin_metadata = serializers.SerializerMethodField(read_only=True)
 
     # ManyToMany: show genre names on read
     genre_names = serializers.StringRelatedField(source='genres', many=True, read_only=True)
@@ -91,9 +156,28 @@ class BookSerializer(serializers.HyperlinkedModelSerializer):
             'genre_ids',
             'published_date',
             'time_since_published',
+            'admin_metadata',
         ]
         extra_kwargs = {
             'title': {'error_messages': {'blank': 'Title cannot be blank.'}},
+        }
+
+    def __init__(self, *args, **kwargs):
+        """
+        Dynamically include/exclude fields based on query parameters and permissions.
+        """
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        is_staff = bool(user and getattr(user, "is_authenticated", False) and getattr(user, "is_staff", False))
+        if not is_staff:
+            self.fields.pop("admin_metadata", None)
+
+    def get_admin_metadata(self, obj):
+        return {
+            "internal_code": f"LIB-BK-{obj.id:05d}",
+            "author_id": obj.author_id,
+            "genres_count": obj.genres.count(),
         }
 
     def get_time_since_published(self, obj):
@@ -137,6 +221,10 @@ class BookSerializer(serializers.HyperlinkedModelSerializer):
                     "Published date cannot be before the author's date of birth."
                 )
         return data
+
+
+# Alias for backward compatibility
+BookSerializer = BookDetailSerializer
 
 
 class GenreAssignSerializer(serializers.Serializer):

@@ -13,6 +13,8 @@ from books_app.pagination import BookCursorPagination, BookLimitOffsetPagination
 from books_app.query_params import int_param
 from books_app.serializers import (
     BookSerializer,
+    BookListSerializer,
+    BookDetailSerializer,
     AuthorSerializer,
     GenreSerializer,
     GenreAssignSerializer,
@@ -23,7 +25,7 @@ from books_app.serializers import (
 
 class BookViewSet(viewsets.ModelViewSet):
     queryset = Book.objects.select_related("author").prefetch_related("genres")
-    serializer_class = BookSerializer
+    serializer_class = BookDetailSerializer
     pagination_class = BookLimitOffsetPagination
 
     # Project defaults plus the Book-specific custom backend.
@@ -37,6 +39,19 @@ class BookViewSet(viewsets.ModelViewSet):
     search_fields = ["title", "author__name"]
     ordering_fields = ["title", "published_date"]
     ordering = ["-published_date"]
+
+    def get_serializer_class(self):
+        """
+        Dynamically return serializer class based on action:
+        - 'list', 'recent', 'featured': lightweight BookListSerializer
+        - 'retrieve', 'create', 'update', 'partial_update': comprehensive BookDetailSerializer
+        - custom actions: respects action serializer_class or falls back to default
+        """
+        if self.action in ["list", "recent", "featured"]:
+            return BookListSerializer
+        if self.action in ["retrieve", "create", "update", "partial_update"]:
+            return BookDetailSerializer
+        return super().get_serializer_class()
 
     @action(detail=False, methods=["get"])
     def recent(self, request):
