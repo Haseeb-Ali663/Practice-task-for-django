@@ -1,6 +1,9 @@
+import time
 from datetime import date, timedelta
 from django.contrib.auth.models import User
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework.test import APITestCase, APIRequestFactory
 from rest_framework import status
@@ -1151,6 +1154,118 @@ class DynamicFieldsSerializerTest(APITestCase):
         self.assertEqual(set(serializer.data.keys()), {"title", "author_name"})
         self.assertEqual(serializer.data["title"], "1984")
         self.assertEqual(serializer.data["author_name"], "George Orwell")
+
+
+# ──────────────────────────────────────────────
+#  9. PERFORMANCE OPTIMIZATION & BENCHMARK TESTS
+# ──────────────────────────────────────────────
+
+class PerformanceOptimizationTest(APITestCase):
+    """
+    Tests for performance optimizations:
+    1. select_related() and prefetch_related() elimination of N+1 queries.
+    2. Dynamic get_queryset() optimization.
+    3. Conditional prefetching based on requested ?fields=.
+    4. Quantitative performance benchmark comparing unoptimized vs optimized queries.
+    """
+
+    def setUp(self):
+        self.genres = [
+            Genre.objects.create(name=f"Genre {i}") for i in range(1, 4)
+        ]
+        self.authors = [
+            Author.objects.create(name=f"Author {i}", date_of_birth=date(1970, 1, 1))
+            for i in range(1, 6)
+        ]
+        # Create 10 books linked to various authors and multiple genres
+        self.books = []
+        for i in range(1, 11):
+            book = Book.objects.create(
+                title=f"Book {i}",
+                author=self.authors[i % len(self.authors)],
+                published_date=date(2000 + i, 1, 1),
+            )
+            book.genres.set(self.genres)
+            self.books.append(book)
+
+    def test_n_plus_one_elimination_in_list_view(self):
+        """
+        Listing 10 books with authors & genres should execute a fixed, minimal number of queries:
+        1. COUNT(*) for pagination
+        2. SELECT books JOIN author (via select_related)
+        3. SELECT genres IN (...) (via prefetch_related)
+        Total queries must be <= 3 regardless of number of books (O(1) query complexity).
+        """
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.client.get(reverse("book-list"), {"limit": 10})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(response.data["results"]), 10)
+
+        # 3 queries total: 1 COUNT + 1 SELECT books/author + 1 PREFETCH genres
+        self.assertLessEqual(len(ctx.captured_queries), 3)
+
+    def test_conditional_prefetch_reduces_queries(self):
+        """
+        When ?fields=title,published_date is passed, get_queryset() dynamically skips
+        prefetch_related('genres'), reducing SQL queries by 1.
+        """
+        # Full fields (needs genres prefetch)
+        with CaptureQueriesContext(connection) as full_ctx:
+            self.client.get(reverse("book-list"), {"limit": 10})
+
+        # Partial fields without genres/author (skips genres prefetch)
+        with CaptureQueriesContext(connection) as partial_ctx:
+            response = self.client.get(reverse("book-list"), {"limit": 10, "fields": "title,published_date"})
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Partial query count should be strictly fewer than full query count
+        self.assertLess(len(partial_ctx.captured_queries), len(full_ctx.captured_queries))
+
+    def test_performance_comparison_benchmark(self):
+        """
+        Measure and compare query efficiency:
+        - Unoptimized traversal (evaluating author + genres in Python without prefetch) -> 1 + N + N queries.
+        - Optimized traversal (select_related + prefetch_related) -> 2 queries.
+        """
+        # 1. Unoptimized measurement:
+        with CaptureQueriesContext(connection) as unopt_ctx:
+            start_unopt = time.perf_counter()
+            unopt_books = list(Book.objects.all())
+            unopt_data = []
+            for b in unopt_books:
+                unopt_data.append({
+                    "title": b.title,
+                    "author": b.author.name,
+                    "genres": [g.name for g in b.genres.all()]
+                })
+            time_unopt = time.perf_counter() - start_unopt
+
+        # 10 books => 1 (books) + 10 (authors) + 10 (genres) = 21 queries
+        unopt_query_count = len(unopt_ctx.captured_queries)
+        self.assertGreaterEqual(unopt_query_count, 21)
+
+        # 2. Optimized measurement:
+        with CaptureQueriesContext(connection) as opt_ctx:
+            start_opt = time.perf_counter()
+            opt_books = list(Book.objects.select_related("author").prefetch_related("genres"))
+            opt_data = []
+            for b in opt_books:
+                opt_data.append({
+                    "title": b.title,
+                    "author": b.author.name,
+                    "genres": [g.name for g in b.genres.all()]
+                })
+            time_opt = time.perf_counter() - start_opt
+
+        # Optimized => exactly 2 queries (1 for books+author, 1 for genres)
+        opt_query_count = len(opt_ctx.captured_queries)
+        self.assertEqual(opt_query_count, 2)
+
+        # Verify data consistency
+        self.assertEqual(unopt_data, opt_data)
+        # Verify query reduction: 21+ queries down to 2
+        self.assertLess(opt_query_count, unopt_query_count)
+
 
 
 

@@ -24,7 +24,6 @@ from books_app.serializers import (
 
 
 class BookViewSet(viewsets.ModelViewSet):
-    queryset = Book.objects.select_related("author").prefetch_related("genres")
     serializer_class = BookDetailSerializer
     pagination_class = BookLimitOffsetPagination
 
@@ -39,6 +38,39 @@ class BookViewSet(viewsets.ModelViewSet):
     search_fields = ["title", "author__name"]
     ordering_fields = ["title", "published_date"]
     ordering = ["-published_date"]
+
+    def get_queryset(self):
+        """
+        Dynamically optimize querysets based on action and requested fields:
+        1. Base queryset: Book.objects.all()
+        2. Conditional select_related('author'):
+           - Joined only when author fields are needed (e.g. ?fields=title skips author join).
+        3. Conditional prefetch_related('genres'):
+           - Prefetched only when genre fields are needed (e.g. ?fields=title skips genre prefetch).
+        """
+        queryset = Book.objects.all()
+
+        # Check requested fields if ?fields=... query param is provided
+        fields_param = (
+            self.request.query_params.get("fields")
+            if hasattr(self, "request") and self.request
+            else None
+        )
+
+        if fields_param:
+            requested = {f.strip() for f in fields_param.split(",") if f.strip()}
+            needs_author = bool({"author", "author_name", "author_custom", "author_id"} & requested)
+            needs_genres = bool({"genres", "genre_names", "genre_ids"} & requested)
+        else:
+            needs_author = True
+            needs_genres = True
+
+        if needs_author:
+            queryset = queryset.select_related("author")
+        if needs_genres:
+            queryset = queryset.prefetch_related("genres")
+
+        return queryset
 
     def get_serializer_class(self):
         """
